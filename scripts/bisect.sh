@@ -26,6 +26,7 @@ BACKEND="${BACKEND:-vulkan}"
 KS="${KS:-100,200,400}"
 N="${N:-256}"
 RUNS="${RUNS:-30}"
+BINDINGS="${BINDINGS:-1}"   # read-write storage buffers per dispatch (barriers/dispatch)
 TS_PERIOD="${TS_PERIOD:-1.0}"
 VERSIONS="${VERSIONS:-v29.0.0.0 v27.0.4.1 v25.0.2.2}"
 CACHE="${CACHE:-$HOME/.cache/wgpu-bisect}"
@@ -81,7 +82,7 @@ for tag in ${VERSIONS}; do
   fl="$(flags_for "${tag}")"
   echo ">>> building chainprobe against ${tag} (CGO_CFLAGS='${fl}')" >&2
   CGO_ENABLED=1 CGO_CFLAGS="${fl}" "${GO}" build -o "/tmp/chainprobe-${tag}" ./cmd/chainprobe
-  "/tmp/chainprobe-${tag}" -backend "${BACKEND}" -ksweep "${KS}" -n "${N}" -runs "${RUNS}" -csv \
+  "/tmp/chainprobe-${tag}" -backend "${BACKEND}" -ksweep "${KS}" -n "${N}" -runs "${RUNS}" -bindings "${BINDINGS}" -csv \
     | sed -n 's/^csv,//p' | sed "s/^/csv,/"
   echo >&2
 done
