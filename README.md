@@ -81,6 +81,7 @@ exposes v29-only capabilities useful for the dot4 work:
 | Pipeline-overridable WGSL constants | `ProgrammableStageDescriptor.Constants []ConstantEntry` |
 | Push-constant-equivalent immediates | `ComputePassEncoder.SetImmediates`, `NativeFeatureImmediates`, `Limits.MaxPushConstantSize` (→ `maxImmediateSize`) |
 | Subgroup adapter info | `AdapterInfo.SubgroupMinSize/MaxSize`, `FeatureNameSubgroups`, `NativeFeatureSubgroup` |
+| Batched dispatch recording (one CGO crossing for a whole chain; ~5× faster record) | `ComputePassEncoder.RecordSteps([]ComputeStep)` |
 
 ## License
 

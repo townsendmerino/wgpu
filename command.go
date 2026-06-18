@@ -6,6 +6,23 @@ package wgpu
 #include <stdlib.h>
 #include <stdint.h>
 #include "./lib/wgpu.h"
+
+// cgoRecordSteps records a batch of compute dispatches into a pass with the loop
+// running entirely in C, so the whole batch costs ONE Go->C crossing instead of
+// ~3 per dispatch. Each step binds its pipeline + bind group at group 0 (no
+// dynamic offsets) and dispatches (x,y,z); xyz is n*3 packed. Redundant
+// SetPipeline calls (same as previous step) are skipped.
+static void cgoRecordSteps(WGPUComputePassEncoder pass, size_t n,
+                           WGPUComputePipeline const *pls,
+                           WGPUBindGroup const *bgs,
+                           uint32_t const *xyz) {
+    WGPUComputePipeline cur = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (pls[i] != cur) { wgpuComputePassEncoderSetPipeline(pass, pls[i]); cur = pls[i]; }
+        wgpuComputePassEncoderSetBindGroup(pass, 0, bgs[i], 0, NULL);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, xyz[i*3], xyz[i*3+1], xyz[i*3+2]);
+    }
+}
 */
 import "C"
 
@@ -141,6 +158,46 @@ func (p *ComputePassEncoder) SetBindGroup(groupIndex uint32, group *BindGroup, d
 func (p *ComputePassEncoder) DispatchWorkgroups(workgroupCountX, workgroupCountY, workgroupCountZ uint32) {
 	C.wgpuComputePassEncoderDispatchWorkgroups(p.ref, C.uint32_t(workgroupCountX),
 		C.uint32_t(workgroupCountY), C.uint32_t(workgroupCountZ))
+}
+
+// ComputeStep is one dispatch in a RecordSteps batch: bind Pipeline + BindGroup
+// at group 0 (no dynamic offsets) and dispatch (X,Y,Z) workgroups. It models the
+// common serial-decode-spine step (one bind group at group 0); use the per-call
+// SetPipeline/SetBindGroup/DispatchWorkgroups methods directly if you need a
+// non-zero group index or dynamic offsets.
+type ComputeStep struct {
+	Pipeline  *ComputePipeline
+	BindGroup *BindGroup
+	X, Y, Z   uint32
+}
+
+// RecordSteps records a batch of dispatches into the pass in a SINGLE cgo
+// crossing — the per-step SetPipeline/SetBindGroup/DispatchWorkgroups loop runs
+// in C. This is an additive, non-cogentcore-mirroring fast path for hot recorders
+// (e.g. a ~hundreds-of-dispatch decode chain): equivalent to calling the three
+// per-call methods for each step in order, but collapses ~3*len(steps) Go->C
+// crossings into one. Consecutive steps that share a pipeline skip the redundant
+// SetPipeline. A nil Pipeline or BindGroup in any step panics (programmer error).
+func (p *ComputePassEncoder) RecordSteps(steps []ComputeStep) {
+	n := len(steps)
+	if n == 0 {
+		return
+	}
+	pls := make([]C.WGPUComputePipeline, n)
+	bgs := make([]C.WGPUBindGroup, n)
+	xyz := make([]C.uint32_t, n*3)
+	for i := range steps {
+		s := &steps[i]
+		if s.Pipeline == nil || s.BindGroup == nil {
+			panic("wgpu: RecordSteps: step has nil Pipeline or BindGroup")
+		}
+		pls[i] = s.Pipeline.ref
+		bgs[i] = s.BindGroup.ref
+		xyz[i*3] = C.uint32_t(s.X)
+		xyz[i*3+1] = C.uint32_t(s.Y)
+		xyz[i*3+2] = C.uint32_t(s.Z)
+	}
+	C.cgoRecordSteps(p.ref, C.size_t(n), &pls[0], &bgs[0], &xyz[0])
 }
 
 // SetImmediates writes push-constant-equivalent "immediate" data (v29 extra;
