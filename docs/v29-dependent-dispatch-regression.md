@@ -1,15 +1,18 @@
 # v29 dependent-dispatch chain: regression investigation
 
-**Verdict (TL;DR):** On a generic serially-dependent compute-dispatch chain, the
+**Verdict (TL;DR):** On a serially-dependent compute-dispatch chain, the
 per-barrier and per-dispatch costs are **flat from the v22-era lib (cogentcore)
-through v29** — there is **no wgpu-native regression** in generic dependent
-dispatches. The synthetic chain does **not** reproduce goinfer's +1.9 ms/token.
-Per the investigation's STEP-1 stop condition, this means the cost is **specific
-to goinfer's kernel/binding shapes**, not to a change in how wgpu-hal emits
-barriers between dispatches. There is therefore **no version "sweet-spot" pin to
-recover** and **no generic upstream bug to file**; the next move is to widen the
-synthetic per-dispatch surface to match goinfer's kernels (see
-[§Recommended follow-up](#recommended-follow-up)).
+through v29** — there is **no wgpu-native regression** in dependent dispatches.
+This holds not just for one barrier per dispatch but **across 1–8 barriers per
+dispatch** (the [barriers-per-dispatch sweep](#follow-up-done-barriers-per-dispatch-sweep)
+generalizes the chain to goinfer-like multi-buffer kernels): per-barrier cost
+*scales with the number of storage-buffer transitions per dispatch* but is
+identical on every version at every count (v29 within ~2% of v22 at B=8). The
+synthetic chain does **not** reproduce goinfer's +1.9 ms/token on any axis it
+can express. Per STEP-1's stop condition, the cost is therefore **not a generic
+wgpu-hal barrier change** — it is **specific to goinfer's setup** (and likely not
+barrier-bound at all). There is **no version "sweet-spot" pin to recover** and
+**no upstream bug to file**.
 
 ---
 
@@ -93,17 +96,21 @@ Ruled **out** as the cause:
 - An instance-flag / validation default (runs were Empty-flags, validation off).
 - A submit/poll-granularity effect on the barrier itself.
 
+- **More barriers per dispatch** — tested directly in the
+  [sweep below](#follow-up-done-barriers-per-dispatch-sweep) (1–8 storage-buffer
+  barriers/dispatch). Per-barrier scales with count but stays flat across
+  versions, so this is **also ruled out** as a *version* cause.
+
 Ruled **in** (remaining, goinfer-specific) — the +3.5 µs/dispatch must track
-something the trivial kernel lacks. Most likely, in rough order:
-1. **More barriers per dispatch.** goinfer's decode kernels bind several
-   read-write storage buffers; if v29's state tracker emits a transition per
-   touched buffer, a kernel with N storage buffers pays ≈N× the single-barrier
-   cost, and any per-buffer-transition change is multiplied by N — invisible to a
-   2-binding chain.
-2. **Larger working sets / buffer sizes** forcing real cache/memory traffic per
-   barrier rather than the 1 KB here.
-3. **Bind-group / pipeline rebinding** cost differences per dispatch.
-4. **Buffer usage-state churn** (e.g. uniform/storage/copy transitions) absent here.
+something none of these benches express. Candidates, now that barrier cost
+(single- and multi-buffer) is eliminated:
+1. **The chain isn't actually barrier-bound** in goinfer the way modeled (e.g.
+   real per-dispatch ALU/memory work dominates, and that path changed).
+2. **Larger working sets / buffer sizes** forcing real cache/memory traffic
+   (these buffers are 1 KB).
+3. **Dispatch count / submit structure / CPU-side encode** differences between
+   the two measured goinfer configurations.
+4. **Pipeline/shader specialization** differences (naga codegen) per kernel.
 
 ## Mitigation
 
@@ -122,23 +129,51 @@ something the trivial kernel lacks. Most likely, in rough order:
   directly. Note this repo's scope is the binding; goinfer is explicitly not to
   be modified here — this is guidance for that work, not a change.
 
-## Recommended follow-up
+## Follow-up (done): barriers-per-dispatch sweep
 
-One targeted experiment converts "goinfer-specific" from inference to a named
-cause: extend the bench with a `-bindings B` knob that gives each dispatch **B**
-read-write storage buffers (B barriers/dispatch), then re-run the
-v22→v29 bisect at B = 1, 2, 4, 8.
+The trivial chain above forces exactly **one** barrier per dispatch; goinfer's
+decode kernels bind several read-write storage buffers, so the worry was that a
+v29 state-tracker change might cost more *per touched buffer*, invisible to a
+2-binding chain. The benches gained a `-bindings B` knob (each dispatch
+increments **B** read-write storage buffers in place → **B barriers/dispatch**),
+and the v22→v29 bisect was re-run at B = 1, 2, 4, 8 on the same Vulkan GPU
+(K=400, n=256, 30 runs).
 
-- If per-barrier stays flat across versions at every B → the cost scales with
-  goinfer's barrier *count*, but wgpu's *per-barrier* cost still never regressed;
-  the fix is purely in goinfer's chain shape.
-- If the v22→v29 gap **opens up** as B grows → that is the regression, now with a
-  minimal multi-buffer repro suitable to file upstream. (Draft issue title:
-  *"compute-pass: per-dispatch barrier cost scales with bound storage-buffer
-  count on Vulkan in vNN, not in v22"* — fill in once measured.)
+**per-barrier (µs) — by barriers/dispatch × version:**
 
-This is the single highest-value next step and is cheap (one bench edit + one
-`bisect.sh` run on the box).
+| barriers/dispatch | cogent (v22-era) | v25.0.2.2 | v27.0.4.1 | v29.0.0.0 |
+|-------------------|------------------|-----------|-----------|-----------|
+| 1                 | 1.330            | 1.349     | 1.351     | 1.332     |
+| 2                 | 1.493            | 1.537     | 1.513     | 1.514     |
+| 4                 | 1.818            | 1.871     | 1.871     | 1.874     |
+| 8                 | 2.478            | 2.538     | 2.538     | 2.537     |
+
+Two facts:
+1. **Per-barrier scales with B** — ≈ a 1.17 µs fixed pipeline-barrier floor plus
+   ≈0.16 µs per additional bound storage-buffer transition. So a kernel that
+   forces more read↔write storage transitions per dispatch *does* cost
+   proportionally more. The absolute cost is real and is a function of the chain
+   shape.
+2. **It is still flat across versions at every B.** The v22→v29 gap never opens:
+   v29 is within ~2% of the v22-era baseline even at 8 barriers/dispatch. There
+   is **no version-dependent component** to barrier cost, single- or multi-buffer.
+
+This **rules out the leading remaining hypothesis** (a v29 per-buffer-transition
+regression) and makes the verdict definitive: wgpu-native's barrier behavior did
+not regress v22→v29 on any axis this bench can express. goinfer's +1.9 ms must
+come from something **outside generic compute-pass barriers** — e.g. its chain
+not actually being barrier-bound the way modeled, larger buffers driving real
+memory traffic, a difference in dispatch count or submit structure, or a
+CPU-side/encode cost — and is therefore not addressable by a wgpu version change.
+
+The one actionable lever this *does* surface for that separate goinfer work:
+because per-barrier scales ≈0.16 µs × (storage transitions/dispatch), cutting the
+number of read↔write storage buffers per decode dispatch (or fusing/batching to
+let independent steps overlap) reduces the cost directly — on every wgpu version
+equally. (Out of scope for this repo; goinfer is not modified here.)
+
+Reproduce: `BINDINGS=8 GO=$HOME/sdk/go/bin/go BACKEND=vulkan KS=400 bash scripts/bisect.sh`
+and `cd bench/cogentbase && ./cogentbase -ksweep 400 -bindings 8 -csv`.
 
 ## Appendix: raw CSV
 
