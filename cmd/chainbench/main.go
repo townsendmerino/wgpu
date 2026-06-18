@@ -54,7 +54,11 @@ const workgroupSize = 64
 
 // Trivial latency-bound kernel: out[i] = in[i] + 1. Tiny work on purpose — we
 // are measuring launch+barrier latency, not throughput.
-const chainWGSL = `
+// chainWGSL is the ping-pong kernel: out[i] = in[i] + (variant+1). The variant
+// constant makes each pipeline a distinct object (pipeline-state-switch axis)
+// without changing the work; functionally irrelevant to timing.
+func chainWGSL(variant int) string {
+	return fmt.Sprintf(`
 @group(0) @binding(0) var<storage, read>       inb:  array<u32>;
 @group(0) @binding(1) var<storage, read_write> outb: array<u32>;
 
@@ -62,20 +66,22 @@ const chainWGSL = `
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= arrayLength(&outb)) { return; }
-    outb[i] = inb[i] + 1u;
+    outb[i] = inb[i] + %du;
 }
-`
+`, variant+1)
+}
 
 type config struct {
-	k       int
-	n       int
-	runs    int
-	pass    string // "single" | "per"
-	submit  string // "single" | "per"
-	backend string // "" | "vulkan" | "gl" | "metal" | "d3d12" | "d3d11"
-	mode    string // "both" | "dependent" | "independent"
-	ksweep  string
-	csv     bool
+	k        int
+	n        int
+	runs     int
+	pass     string // "single" | "per"
+	submit   string // "single" | "per"
+	backend  string // "" | "vulkan" | "gl" | "metal" | "d3d12" | "d3d11"
+	mode     string // "both" | "dependent" | "independent"
+	ksweep   string
+	distinct int // number of distinct pipelines cycled across the chain
+	csv      bool
 }
 
 func main() {
@@ -88,8 +94,12 @@ func main() {
 	flag.StringVar(&cfg.backend, "backend", "", "force backend: vulkan|gl|metal|d3d12|d3d11 (default: auto)")
 	flag.StringVar(&cfg.mode, "mode", "both", "which chain: both|dependent|independent")
 	flag.StringVar(&cfg.ksweep, "ksweep", "", "comma-separated K values to sweep (overrides -k), e.g. 100,200,400,800")
+	flag.IntVar(&cfg.distinct, "distinct", 1, "distinct pipelines cycled across the chain (pipeline-state switch axis); 1 = reuse one")
 	flag.BoolVar(&cfg.csv, "csv", false, "emit machine-readable csv rows for cross-version diffing")
 	flag.Parse()
+	if cfg.distinct < 1 {
+		cfg.distinct = 1
+	}
 
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "chainbench: FAIL:", err)
@@ -154,21 +164,31 @@ func run(cfg config) error {
 	queue := device.GetQueue()
 	defer queue.Release()
 
-	sh, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
-		Label: "chain", WGSLDescriptor: &wgpu.ShaderModuleWGSLDescriptor{Code: chainWGSL},
-	})
-	if err != nil {
-		return err
+	// Build cfg.distinct distinct pipelines to cycle across the chain.
+	pls := make([]*wgpu.ComputePipeline, cfg.distinct)
+	seen := map[*wgpu.ComputePipeline]bool{}
+	for p := 0; p < cfg.distinct; p++ {
+		sh, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
+			Label: "chain", WGSLDescriptor: &wgpu.ShaderModuleWGSLDescriptor{Code: chainWGSL(p)},
+		})
+		if err != nil {
+			return err
+		}
+		pl, err := device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
+			Label:   "chain",
+			Compute: wgpu.ProgrammableStageDescriptor{Module: sh, EntryPoint: "main"},
+		})
+		sh.Release()
+		if err != nil {
+			return err
+		}
+		defer pl.Release()
+		pls[p] = pl
+		seen[pl] = true
 	}
-	defer sh.Release()
-	pl, err := device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
-		Label:   "chain",
-		Compute: wgpu.ProgrammableStageDescriptor{Module: sh, EntryPoint: "main"},
-	})
-	if err != nil {
-		return err
+	if len(seen) != cfg.distinct {
+		fmt.Fprintf(os.Stderr, "chainbench: WARNING only %d distinct pipeline handles for -distinct %d\n", len(seen), cfg.distinct)
 	}
-	defer pl.Release()
 
 	ks, err := parseKs(cfg.ksweep, cfg.k)
 	if err != nil {
@@ -183,7 +203,7 @@ func run(cfg config) error {
 	for _, k := range ks {
 		var depGPU, indepGPU float64
 		runOne := func(mode string) (gpuMS, wallMS float64, err error) {
-			h := newHarness(device, queue, pl, cfg, k)
+			h := newHarness(device, queue, pls, cfg, k)
 			defer h.release()
 			if err := h.build(mode); err != nil {
 				return 0, 0, err
@@ -248,8 +268,8 @@ func emitCSV(on bool, ver uint32, backend, mode string, k int, cfg config, gpuMS
 	if !on {
 		return
 	}
-	fmt.Printf("csv,0x%08x,%s,%s,%d,%d,%s,%s,%.4f,%.4f,%.4f,%.4f\n",
-		ver, backend, mode, k, cfg.n, cfg.pass, cfg.submit, gpuMS, wallMS, perDispUS, perBarrUS)
+	fmt.Printf("csv,0x%08x,%s,%s,%d,%d,%s,%s,d%d,%.4f,%.4f,%.4f,%.4f\n",
+		ver, backend, mode, k, cfg.n, cfg.pass, cfg.submit, cfg.distinct, gpuMS, wallMS, perDispUS, perBarrUS)
 }
 
 // ---- harness ---------------------------------------------------------------
@@ -259,21 +279,24 @@ func emitCSV(on bool, ver uint32, backend, mode string, k int, cfg config, gpuMS
 type harness struct {
 	device *wgpu.Device
 	queue  *wgpu.Queue
-	pl     *wgpu.ComputePipeline
+	pls    []*wgpu.ComputePipeline // N distinct pipelines; dispatch i uses pls[i%N]
 	cfg    config
 	k      int
 
 	bufs []*wgpu.Buffer
-	bgs  []*wgpu.BindGroup // one per dispatch; bgs[i] is what dispatch i binds
+	bgs  []*wgpu.BindGroup // one per dispatch; bgs[i] matches pls[i%N]'s layout
 
 	qset     *wgpu.QuerySet
 	tsResolv *wgpu.Buffer
 	tsStage  *wgpu.Buffer
 }
 
-func newHarness(d *wgpu.Device, q *wgpu.Queue, pl *wgpu.ComputePipeline, cfg config, k int) *harness {
-	return &harness{device: d, queue: q, pl: pl, cfg: cfg, k: k}
+func newHarness(d *wgpu.Device, q *wgpu.Queue, pls []*wgpu.ComputePipeline, cfg config, k int) *harness {
+	return &harness{device: d, queue: q, pls: pls, cfg: cfg, k: k}
 }
+
+// pipe returns the pipeline for dispatch i (cycles through the distinct set).
+func (h *harness) pipe(i int) *wgpu.ComputePipeline { return h.pls[i%len(h.pls)] }
 
 // build allocates buffers and bind groups for the requested chain shape.
 //
@@ -286,9 +309,9 @@ func (h *harness) build(mode string) error {
 	mk := func(label string, usage wgpu.BufferUsage) (*wgpu.Buffer, error) {
 		return h.device.CreateBuffer(&wgpu.BufferDescriptor{Label: label, Size: sizeBytes, Usage: usage})
 	}
-	mkbg := func(in, out *wgpu.Buffer) (*wgpu.BindGroup, error) {
+	mkbg := func(pipe int, in, out *wgpu.Buffer) (*wgpu.BindGroup, error) {
 		return h.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
-			Layout: h.pl.GetBindGroupLayout(0),
+			Layout: h.pipe(pipe).GetBindGroupLayout(0),
 			Entries: []wgpu.BindGroupEntry{
 				{Binding: 0, Buffer: in, Size: in.GetSize()},
 				{Binding: 1, Buffer: out, Size: out.GetSize()},
@@ -314,7 +337,7 @@ func (h *harness) build(mode string) error {
 			if i%2 == 1 {
 				in, out = b, a
 			}
-			bg, err := mkbg(in, out)
+			bg, err := mkbg(i, in, out)
 			if err != nil {
 				return err
 			}
@@ -333,7 +356,7 @@ func (h *harness) build(mode string) error {
 				return err
 			}
 			h.bufs = append(h.bufs, out)
-			bg, err := mkbg(shared, out)
+			bg, err := mkbg(i, shared, out)
 			if err != nil {
 				return err
 			}
@@ -449,7 +472,7 @@ func (h *harness) encodeAndRun(useTS bool, period float64) (float64, error) {
 				return 0, err
 			}
 			pass := enc.BeginComputePass(nil)
-			pass.SetPipeline(h.pl)
+			pass.SetPipeline(h.pipe(i))
 			pass.SetBindGroup(0, h.bgs[i], nil)
 			pass.DispatchWorkgroups(h.groups(), 1, 1)
 			if err := pass.End(); err != nil {
@@ -485,8 +508,8 @@ func (h *harness) encodeChain(enc *wgpu.CommandEncoder, singlePass, withTS bool)
 			}}
 		}
 		pass := enc.BeginComputePass(pd)
-		pass.SetPipeline(h.pl)
 		for i := 0; i < h.k; i++ {
+			pass.SetPipeline(h.pipe(i))
 			pass.SetBindGroup(0, h.bgs[i], nil)
 			pass.DispatchWorkgroups(h.groups(), 1, 1)
 		}
@@ -513,7 +536,7 @@ func (h *harness) encodeChain(enc *wgpu.CommandEncoder, singlePass, withTS bool)
 			pd = &wgpu.ComputePassDescriptor{TimestampWrites: tw}
 		}
 		pass := enc.BeginComputePass(pd)
-		pass.SetPipeline(h.pl)
+		pass.SetPipeline(h.pipe(i))
 		pass.SetBindGroup(0, h.bgs[i], nil)
 		pass.DispatchWorkgroups(h.groups(), 1, 1)
 		if err := pass.End(); err != nil {

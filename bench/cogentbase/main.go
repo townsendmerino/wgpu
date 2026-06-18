@@ -35,10 +35,12 @@ const workgroupSize = 64
 
 const tsPeriod = 1.0 // NVIDIA Vulkan ns/tick (cogentcore has no GetTimestampPeriod)
 
-// kernelWGSL generates a kernel incrementing B read_write storage buffers in
-// place (one binding each) — B barriers/dispatch in the dependent chain. Must
-// match cmd/chainprobe's kernelWGSL exactly for cross-version comparability.
-func kernelWGSL(b int) string {
+// kernelWGSL generates a kernel incrementing b read_write storage buffers in
+// place (one binding each) — b barriers/dispatch in the dependent chain. The
+// variant bakes a distinct literal so each compiles to a separate pipeline
+// object (pipeline-state-switch axis). Must match cmd/chainprobe's kernelWGSL
+// exactly for cross-version comparability.
+func kernelWGSL(b, variant int) string {
 	var sb strings.Builder
 	for j := 0; j < b; j++ {
 		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, read_write> b%d: array<u32>;\n", j, j)
@@ -48,7 +50,11 @@ func kernelWGSL(b int) string {
 	sb.WriteString("    let i = gid.x;\n")
 	sb.WriteString("    if (i >= arrayLength(&b0)) { return; }\n")
 	for j := 0; j < b; j++ {
-		fmt.Fprintf(&sb, "    b%d[i] = b%d[i] + 1u;\n", j, j)
+		if j == 0 {
+			fmt.Fprintf(&sb, "    b0[i] = b0[i] + %du;\n", variant+1)
+		} else {
+			fmt.Fprintf(&sb, "    b%d[i] = b%d[i] + 1u;\n", j, j)
+		}
 	}
 	sb.WriteString("}\n")
 	return sb.String()
@@ -61,19 +67,23 @@ func main() {
 	ksweep := flag.String("ksweep", "", "comma-separated K values (overrides -k)")
 	mode := flag.String("mode", "both", "both|dependent|independent")
 	bindings := flag.Int("bindings", 1, "read-write storage buffers per dispatch (barriers/dispatch)")
+	distinct := flag.Int("distinct", 1, "number of DISTINCT pipelines cycled across the chain (pipeline-state switch axis); 1 = reuse one")
 	csv := flag.Bool("csv", false, "emit csv rows")
 	flag.Parse()
 
 	if *bindings < 1 {
 		*bindings = 1
 	}
-	if err := run(*k, *n, *runs, *bindings, *ksweep, *mode, *csv); err != nil {
+	if *distinct < 1 {
+		*distinct = 1
+	}
+	if err := run(*k, *n, *runs, *bindings, *distinct, *ksweep, *mode, *csv); err != nil {
 		fmt.Fprintln(os.Stderr, "cogentbase: FAIL:", err)
 		os.Exit(1)
 	}
 }
 
-func run(k, n, runs, bindings int, ksweep, mode string, csv bool) error {
+func run(k, n, runs, bindings, distinct int, ksweep, mode string, csv bool) error {
 	inst := wgpu.CreateInstance(nil)
 	defer inst.Release()
 	adapter, err := inst.RequestAdapter(&wgpu.RequestAdapterOptions{PowerPreference: wgpu.PowerPreferenceHighPerformance})
@@ -98,21 +108,26 @@ func run(k, n, runs, bindings int, ksweep, mode string, csv bool) error {
 	queue := device.GetQueue()
 	defer queue.Release()
 
-	sh, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
-		Label: "chain", WGSLDescriptor: &wgpu.ShaderModuleWGSLDescriptor{Code: kernelWGSL(bindings)},
-	})
-	if err != nil {
-		return err
+	// Build N distinct pipelines (one per variant) to cycle across the chain.
+	pls := make([]*wgpu.ComputePipeline, distinct)
+	for p := 0; p < distinct; p++ {
+		sh, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
+			Label: "chain", WGSLDescriptor: &wgpu.ShaderModuleWGSLDescriptor{Code: kernelWGSL(bindings, p)},
+		})
+		if err != nil {
+			return err
+		}
+		pl, err := device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
+			Label:   "chain",
+			Compute: wgpu.ProgrammableStageDescriptor{Module: sh, EntryPoint: "main"},
+		})
+		sh.Release()
+		if err != nil {
+			return err
+		}
+		defer pl.Release()
+		pls[p] = pl
 	}
-	defer sh.Release()
-	pl, err := device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
-		Label:   "chain",
-		Compute: wgpu.ProgrammableStageDescriptor{Module: sh, EntryPoint: "main"},
-	})
-	if err != nil {
-		return err
-	}
-	defer pl.Release()
 
 	backendName := fmt.Sprintf("%v", info.BackendType)
 	ks := []int{k}
@@ -133,34 +148,34 @@ func run(k, n, runs, bindings int, ksweep, mode string, csv bool) error {
 	doDep := mode == "both" || mode == "dependent"
 	doIndep := mode == "both" || mode == "independent"
 
-	fmt.Printf("\nn=%d elems/dispatch, runs=%d\n", n, runs)
+	fmt.Printf("\nn=%d elems/dispatch, runs=%d, distinct=%d\n", n, runs, distinct)
 	fmt.Printf("%-12s %6s  %12s %12s  %14s %14s\n", "mode", "K", "gpu(ms)", "wall(ms)", "per-disp(us)", "per-barr(us)")
 
 	for _, kk := range ks {
 		var depG, indepG float64
 		if doDep {
-			g, w, err := bench(device, queue, pl, "dependent", kk, n, runs, bindings, hasTS)
+			g, w, err := bench(device, queue, pls, "dependent", kk, n, runs, bindings, hasTS)
 			if err != nil {
 				return fmt.Errorf("dependent K=%d: %w", kk, err)
 			}
 			depG = g
 			fmt.Printf("%-12s %6d  %12.3f %12.3f  %14.3f %14s\n", "dependent", kk, g, w, g*1000/float64(kk), "-")
-			emit(csv, backendName, "dependent", kk, n, g, w, g*1000/float64(kk), 0)
+			emit(csv, backendName, "dependent", kk, n, distinct, g, w, g*1000/float64(kk), 0)
 		}
 		if doIndep {
-			g, w, err := bench(device, queue, pl, "independent", kk, n, runs, bindings, hasTS)
+			g, w, err := bench(device, queue, pls, "independent", kk, n, runs, bindings, hasTS)
 			if err != nil {
 				return fmt.Errorf("independent K=%d: %w", kk, err)
 			}
 			indepG = g
 			fmt.Printf("%-12s %6d  %12.3f %12.3f  %14.3f %14s\n", "independent", kk, g, w, g*1000/float64(kk), "-")
-			emit(csv, backendName, "independent", kk, n, g, w, g*1000/float64(kk), 0)
+			emit(csv, backendName, "independent", kk, n, distinct, g, w, g*1000/float64(kk), 0)
 		}
 		if doDep && doIndep && depG > 0 {
 			perBarr := (depG - indepG) * 1000 / float64(kk)
 			perDisp := indepG * 1000 / float64(kk)
 			fmt.Printf("%-12s %6d  %12s %12s  %14.3f %14.3f   <= isolated\n", "=>", kk, "", "", perDisp, perBarr)
-			emit(csv, backendName, "isolated", kk, n, depG-indepG, 0, perDisp, perBarr)
+			emit(csv, backendName, "isolated", kk, n, distinct, depG-indepG, 0, perDisp, perBarr)
 		}
 	}
 	return nil
@@ -171,21 +186,24 @@ func run(k, n, runs, bindings int, ksweep, mode string, csv bool) error {
 //
 //	dependent:   B buffers shared by all dispatches => B barriers/dispatch.
 //	independent: each dispatch owns B buffers => no hazard, GPU overlaps.
-func bench(device *wgpu.Device, queue *wgpu.Queue, pl *wgpu.ComputePipeline, mode string, k, n, runs, bindings int, hasTS bool) (float64, float64, error) {
+func bench(device *wgpu.Device, queue *wgpu.Queue, pls []*wgpu.ComputePipeline, mode string, k, n, runs, bindings int, hasTS bool) (float64, float64, error) {
 	size := uint64(n * 4)
+	nPipe := len(pls)
 	mkbuf := func() (*wgpu.Buffer, error) {
 		return device.CreateBuffer(&wgpu.BufferDescriptor{Size: size, Usage: wgpu.BufferUsageStorage})
 	}
-	mkbg := func(b []*wgpu.Buffer) (*wgpu.BindGroup, error) {
+	// mkbg builds a bind group against pipeline p's layout (each distinct pipeline
+	// has its own auto layout, so dispatch i cycles pipeline+bindgroup together).
+	mkbg := func(p int, b []*wgpu.Buffer) (*wgpu.BindGroup, error) {
 		entries := make([]wgpu.BindGroupEntry, bindings)
 		for j := 0; j < bindings; j++ {
 			entries[j] = wgpu.BindGroupEntry{Binding: uint32(j), Buffer: b[j], Size: b[j].GetSize()}
 		}
-		return device.CreateBindGroup(&wgpu.BindGroupDescriptor{Layout: pl.GetBindGroupLayout(0), Entries: entries})
+		return device.CreateBindGroup(&wgpu.BindGroupDescriptor{Layout: pls[p].GetBindGroupLayout(0), Entries: entries})
 	}
 
 	var bufs []*wgpu.Buffer
-	bgs := make([]*wgpu.BindGroup, k)
+	bgs := make([]*wgpu.BindGroup, k) // bgs[i] matches pipeline i%nPipe
 	if mode == "dependent" {
 		shared := make([]*wgpu.Buffer, bindings)
 		for j := 0; j < bindings; j++ {
@@ -197,7 +215,7 @@ func bench(device *wgpu.Device, queue *wgpu.Queue, pl *wgpu.ComputePipeline, mod
 			bufs = append(bufs, b)
 		}
 		for i := 0; i < k; i++ {
-			bg, err := mkbg(shared) // distinct bind-group objects over the same B buffers
+			bg, err := mkbg(i%nPipe, shared) // bind group for pipeline i%nPipe over shared buffers
 			if err != nil {
 				return 0, 0, err
 			}
@@ -214,7 +232,7 @@ func bench(device *wgpu.Device, queue *wgpu.Queue, pl *wgpu.ComputePipeline, mod
 				own[j] = b
 				bufs = append(bufs, b)
 			}
-			bg, err := mkbg(own)
+			bg, err := mkbg(i%nPipe, own)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -268,8 +286,8 @@ func bench(device *wgpu.Device, queue *wgpu.Queue, pl *wgpu.ComputePipeline, mod
 			}
 		}
 		pass := enc.BeginComputePass(nil)
-		pass.SetPipeline(pl)
 		for i := 0; i < k; i++ {
+			pass.SetPipeline(pls[i%nPipe])
 			pass.SetBindGroup(0, bgs[i], nil)
 			pass.DispatchWorkgroups(groups, 1, 1)
 		}
@@ -349,9 +367,10 @@ func median(xs []float64) float64 {
 	return cp[len(cp)/2]
 }
 
-func emit(on bool, backend, mode string, k, n int, gpuMS, wallMS, perDisp, perBarr float64) {
+// CSV: csv,0xcoge0023,backend,mode,K,n,distinct,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us
+func emit(on bool, backend, mode string, k, n, distinct int, gpuMS, wallMS, perDisp, perBarr float64) {
 	if !on {
 		return
 	}
-	fmt.Printf("csv,0xcoge0023,%s,%s,%d,%d,%.4f,%.4f,%.4f,%.4f\n", backend, mode, k, n, gpuMS, wallMS, perDisp, perBarr)
+	fmt.Printf("csv,0xcoge0023,%s,%s,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n", backend, mode, k, n, distinct, gpuMS, wallMS, perDisp, perBarr)
 }

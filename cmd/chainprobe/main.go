@@ -89,22 +89,24 @@ static void mapCB(WGPUMapAsyncStatus s, WGPUStringView m, void* u1, void* u2){
     (void)m;(void)u2; mapRes* r=(mapRes*)u1; r->status=(uint32_t)s; r->done=1;
 }
 
-// ---- globals owned by cp_setup / cp_teardown ------------------------------
+// ---- globals owned by cp_init / cp_teardown -------------------------------
+#define CP_MAX_PIPELINES 64
 static WGPUInstance        g_inst;
 static WGPUAdapter         g_adapter;
 static WGPUDevice          g_device;
 static WGPUQueue           g_queue;
-static WGPUComputePipeline g_pipe;
-static WGPUBindGroupLayout g_bgl;
+static WGPUComputePipeline g_pipes[CP_MAX_PIPELINES]; // N distinct pipelines (state-switch axis)
+static WGPUBindGroupLayout g_bgls[CP_MAX_PIPELINES];  // matching auto bind-group layouts
+static int                 g_npipes;
 static int                 g_hasTS;
 static float               g_period;
 static int                 g_bindings; // read-write storage buffers per dispatch (barriers/dispatch)
 
-// cp_setup brings up instance/adapter/device/queue/pipeline for one backend.
-// backend is a WGPUBackendType (0 = auto). kernelSrc is the WGSL (generated in
-// Go for `bindings` read_write storage buffers). Returns 0 on success.
-static int cp_setup(uint32_t backend, const char* kernelSrc, int bindings, char* nameOut, int nameCap, uint32_t* backendOut, int* hasTSout, uint32_t* verOut){
+// cp_init brings up instance/adapter/device/queue for one backend (no pipeline).
+// backend is a WGPUBackendType (0 = auto). Returns 0 on success.
+static int cp_init(uint32_t backend, int bindings, char* nameOut, int nameCap, uint32_t* backendOut, int* hasTSout, uint32_t* verOut){
     g_bindings = bindings;
+    g_npipes = 0;
     *verOut = wgpuGetVersion();
     g_inst = wgpuCreateInstance(NULL);
     if(!g_inst) return 1;
@@ -144,23 +146,31 @@ static int cp_setup(uint32_t backend, const char* kernelSrc, int bindings, char*
     g_device = dr.device;
     g_queue  = wgpuDeviceGetQueue(g_device);
     g_period = g_hasTS ? cp_period(g_queue) : 1.0f;
+    return 0;
+}
 
+// cp_add_pipeline compiles one WGSL variant into a distinct compute pipeline and
+// appends it to the cycle. Returns the pipeline pointer as uintptr (0 on failure)
+// so Go can confirm the handles are genuinely distinct.
+static uintptr_t cp_add_pipeline(const char* kernelSrc){
+    if(g_npipes >= CP_MAX_PIPELINES) return 0;
     WGPUShaderSourceWGSL wgsl; memset(&wgsl,0,sizeof(wgsl));
     wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
     wgsl.code = sv(kernelSrc);
     WGPUShaderModuleDescriptor smd; memset(&smd,0,sizeof(smd));
     smd.nextInChain = &wgsl.chain;
     WGPUShaderModule sh = wgpuDeviceCreateShaderModule(g_device, &smd);
-    if(!sh) return 4;
-
+    if(!sh) return 0;
     WGPUComputePipelineDescriptor cpd; memset(&cpd,0,sizeof(cpd));
     cpd.compute.module = sh;
     cpd.compute.entryPoint = sv("main");
-    g_pipe = wgpuDeviceCreateComputePipeline(g_device, &cpd);
+    WGPUComputePipeline p = wgpuDeviceCreateComputePipeline(g_device, &cpd);
     wgpuShaderModuleRelease(sh);
-    if(!g_pipe) return 5;
-    g_bgl = wgpuComputePipelineGetBindGroupLayout(g_pipe, 0);
-    return 0;
+    if(!p) return 0;
+    int i = g_npipes++;
+    g_pipes[i] = p;
+    g_bgls[i]  = wgpuComputePipelineGetBindGroupLayout(p, 0);
+    return (uintptr_t)p;
 }
 
 static WGPUBuffer mkbuf(uint64_t size){
@@ -168,12 +178,13 @@ static WGPUBuffer mkbuf(uint64_t size){
     bd.size = size; bd.usage = WGPUBufferUsage_Storage;
     return wgpuDeviceCreateBuffer(g_device, &bd);
 }
-// mkbg binds B read_write storage buffers (one barrier per buffer per dispatch).
-static WGPUBindGroup mkbg(WGPUBuffer* b, int B, uint64_t size){
+// mkbg binds B read_write storage buffers against pipeline p's layout (one
+// barrier per buffer per dispatch; bind group is specific to that pipeline).
+static WGPUBindGroup mkbg(int p, WGPUBuffer* b, int B, uint64_t size){
     WGPUBindGroupEntry* e = (WGPUBindGroupEntry*)calloc(B, sizeof(WGPUBindGroupEntry));
     for(int j=0;j<B;j++){ e[j].binding=(uint32_t)j; e[j].buffer=b[j]; e[j].size=size; }
     WGPUBindGroupDescriptor bgd; memset(&bgd,0,sizeof(bgd));
-    bgd.layout=g_bgl; bgd.entryCount=(size_t)B; bgd.entries=e;
+    bgd.layout=g_bgls[p]; bgd.entryCount=(size_t)B; bgd.entries=e;
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_device, &bgd);
     free(e);
     return bg;
@@ -190,19 +201,26 @@ static int cp_bench(int mode, int K, int n, int runs, double* gpuMsOut, double* 
     uint32_t groups = (uint32_t)((n + 63)/64);
     int B = g_bindings;
 
+    int N = g_npipes; // distinct pipelines cycled across dispatches (state-switch axis)
     WGPUBuffer* bufs; int nbufs;
-    WGPUBindGroup* bgs = (WGPUBindGroup*)calloc(K, sizeof(WGPUBindGroup));
-    WGPUBindGroup sharedBG = NULL; // mode 0: one bind group reused for all K
+    WGPUBindGroup* bgs = (WGPUBindGroup*)calloc(K, sizeof(WGPUBindGroup)); // per-dispatch (may alias)
+    WGPUBindGroup* ownbgs; int nown;                                      // distinct bgs to release
     if(mode==0){
+        // dependent: B shared buffers; N distinct bind groups (one per pipeline) over them.
+        // Every consecutive dispatch is a hazard on all B => B barriers/dispatch, regardless of N.
         nbufs=B; bufs=(WGPUBuffer*)calloc(B,sizeof(WGPUBuffer));
         for(int j=0;j<B;j++) bufs[j]=mkbuf(size);
-        sharedBG = mkbg(bufs, B, size);
-        for(int i=0;i<K;i++) bgs[i]=sharedBG;
+        nown=N; ownbgs=(WGPUBindGroup*)calloc(N,sizeof(WGPUBindGroup));
+        for(int p=0;p<N;p++) ownbgs[p]=mkbg(p, bufs, B, size);
+        for(int i=0;i<K;i++) bgs[i]=ownbgs[i % N]; // dispatch i: pipeline i%N + its bind group
     } else {
+        // independent: each dispatch owns B buffers; bind group uses pipeline (i%N)'s layout.
         nbufs=K*B; bufs=(WGPUBuffer*)calloc(nbufs,sizeof(WGPUBuffer));
+        nown=K; ownbgs=(WGPUBindGroup*)calloc(K,sizeof(WGPUBindGroup));
         for(int i=0;i<K;i++){
             for(int j=0;j<B;j++) bufs[i*B+j]=mkbuf(size);
-            bgs[i]=mkbg(&bufs[i*B], B, size);
+            ownbgs[i]=mkbg(i % N, &bufs[i*B], B, size);
+            bgs[i]=ownbgs[i];
         }
     }
 
@@ -227,8 +245,8 @@ static int cp_bench(int mode, int K, int n, int runs, double* gpuMsOut, double* 
         WGPUComputePassDescriptor pd; memset(&pd,0,sizeof(pd)); \
         if(useTS) pd.timestampWrites=&tw; \
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &pd); \
-        wgpuComputePassEncoderSetPipeline(pass, g_pipe); \
         for(int i=0;i<K;i++){ \
+            wgpuComputePassEncoderSetPipeline(pass, g_pipes[i % g_npipes]); \
             wgpuComputePassEncoderSetBindGroup(pass,0,bgs[i],0,NULL); \
             wgpuComputePassEncoderDispatchWorkgroups(pass,groups,1,1); \
         } \
@@ -275,10 +293,9 @@ static int cp_bench(int mode, int K, int n, int runs, double* gpuMsOut, double* 
     free(gpu); free(wal);
 
     // cleanup
-    if(sharedBG){ wgpuBindGroupRelease(sharedBG); }       // mode 0: one shared bg
-    else { for(int i=0;i<K;i++) if(bgs[i]) wgpuBindGroupRelease(bgs[i]); }
+    for(int i=0;i<nown;i++) if(ownbgs[i]) wgpuBindGroupRelease(ownbgs[i]);
     for(int i=0;i<nbufs;i++) if(bufs[i]) wgpuBufferRelease(bufs[i]);
-    free(bgs); free(bufs);
+    free(ownbgs); free(bgs); free(bufs);
     if(qset) wgpuQuerySetRelease(qset);
     if(tsResolve) wgpuBufferRelease(tsResolve);
     if(tsStage) wgpuBufferRelease(tsStage);
@@ -286,8 +303,10 @@ static int cp_bench(int mode, int K, int n, int runs, double* gpuMsOut, double* 
 }
 
 static void cp_teardown(void){
-    if(g_bgl) wgpuBindGroupLayoutRelease(g_bgl);
-    if(g_pipe) wgpuComputePipelineRelease(g_pipe);
+    for(int i=0;i<g_npipes;i++){
+        if(g_bgls[i]) wgpuBindGroupLayoutRelease(g_bgls[i]);
+        if(g_pipes[i]) wgpuComputePipelineRelease(g_pipes[i]);
+    }
     if(g_queue) wgpuQueueRelease(g_queue);
     if(g_device) wgpuDeviceRelease(g_device);
     if(g_adapter) wgpuAdapterRelease(g_adapter);
@@ -305,10 +324,16 @@ import (
 	"unsafe"
 )
 
-// kernelWGSL generates a compute kernel that increments B read_write storage
-// buffers in place, one binding each. With B buffers shared across dispatches,
-// each dispatch is a read-after-write hazard on all B => B barriers/dispatch.
-func kernelWGSL(b int) string {
+// kernelWGSL generates a compute kernel that increments b (=bindings) read_write
+// storage buffers in place, one binding each. With those buffers shared across
+// dispatches, each dispatch is a read-after-write hazard on all b => b
+// barriers/dispatch.
+//
+// variant bakes a distinct literal into the kernel so wgpu compiles each into a
+// SEPARATE shader module + pipeline object (it cannot dedupe them). The added
+// constant is functionally irrelevant to timing — only distinctness matters,
+// which is what forces a real pipeline-state switch when N>1 pipelines cycle.
+func kernelWGSL(b, variant int) string {
 	var sb strings.Builder
 	for j := 0; j < b; j++ {
 		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, read_write> b%d: array<u32>;\n", j, j)
@@ -318,7 +343,12 @@ func kernelWGSL(b int) string {
 	sb.WriteString("    let i = gid.x;\n")
 	sb.WriteString("    if (i >= arrayLength(&b0)) { return; }\n")
 	for j := 0; j < b; j++ {
-		fmt.Fprintf(&sb, "    b%d[i] = b%d[i] + 1u;\n", j, j)
+		// distinct per-variant literal on b0; others just +1u.
+		if j == 0 {
+			fmt.Fprintf(&sb, "    b0[i] = b0[i] + %du;\n", variant+1)
+		} else {
+			fmt.Fprintf(&sb, "    b%d[i] = b%d[i] + 1u;\n", j, j)
+		}
 	}
 	sb.WriteString("}\n")
 	return sb.String()
@@ -366,28 +396,47 @@ func main() {
 	ksweep := flag.String("ksweep", "", "comma-separated K values (overrides -k)")
 	mode := flag.String("mode", "both", "both|dependent|independent")
 	bindings := flag.Int("bindings", 1, "read-write storage buffers per dispatch (barriers/dispatch)")
+	distinct := flag.Int("distinct", 1, "number of DISTINCT pipelines cycled across the chain (pipeline-state switch axis); 1 = reuse one pipeline")
 	csv := flag.Bool("csv", false, "emit csv rows")
 	flag.Parse()
 
 	if *bindings < 1 {
 		*bindings = 1
 	}
-	kernelSrc := C.CString(kernelWGSL(*bindings))
-	defer C.free(unsafe.Pointer(kernelSrc))
+	if *distinct < 1 {
+		*distinct = 1
+	}
 
 	var name [256]C.char
 	var bk C.uint32_t
 	var hasTS C.int
 	var ver C.uint32_t
-	if rc := C.cp_setup(backendCode(*backend), kernelSrc, C.int(*bindings), &name[0], 256, &bk, &hasTS, &ver); rc != 0 {
-		fmt.Fprintf(os.Stderr, "chainprobe: cp_setup failed rc=%d (backend=%q bindings=%d)\n", int(rc), *backend, *bindings)
+	if rc := C.cp_init(backendCode(*backend), C.int(*bindings), &name[0], 256, &bk, &hasTS, &ver); rc != 0 {
+		fmt.Fprintf(os.Stderr, "chainprobe: cp_init failed rc=%d (backend=%q)\n", int(rc), *backend)
 		os.Exit(1)
 	}
 	defer C.cp_teardown()
 
+	// Build N distinct pipelines (one per variant). Confirm the handles differ so
+	// the cycle genuinely switches pipeline state rather than re-dispatching one.
+	handles := make(map[uintptr]bool)
+	for p := 0; p < *distinct; p++ {
+		src := C.CString(kernelWGSL(*bindings, p))
+		h := uintptr(C.cp_add_pipeline(src))
+		C.free(unsafe.Pointer(src))
+		if h == 0 {
+			fmt.Fprintf(os.Stderr, "chainprobe: cp_add_pipeline failed at variant %d\n", p)
+			os.Exit(1)
+		}
+		handles[h] = true
+	}
+	if len(handles) != *distinct {
+		fmt.Fprintf(os.Stderr, "chainprobe: WARNING only %d distinct pipeline handles for -distinct %d (dedupe?)\n", len(handles), *distinct)
+	}
+
 	bn := backendName(uint32(bk))
 	fmt.Printf("wgpu-native version: 0x%08x\n", uint32(ver))
-	fmt.Printf("adapter: %s | backend=%s | timestamps=%v | bindings=%d\n", C.GoString(&name[0]), bn, hasTS != 0, *bindings)
+	fmt.Printf("adapter: %s | backend=%s | timestamps=%v | bindings=%d | distinct=%d\n", C.GoString(&name[0]), bn, hasTS != 0, *bindings, *distinct)
 
 	ks := []int{*k}
 	if strings.TrimSpace(*ksweep) != "" {
@@ -423,26 +472,27 @@ func main() {
 			g, w := run(0, kk)
 			depG = g
 			fmt.Printf("%-12s %6d  %12.3f %12.3f  %14.3f %14s\n", "dependent", kk, g, w, g*1000/float64(kk), "-")
-			emit(*csv, uint32(ver), bn, "dependent", kk, *n, g, w, g*1000/float64(kk), 0)
+			emit(*csv, uint32(ver), bn, "dependent", kk, *n, *distinct, g, w, g*1000/float64(kk), 0)
 		}
 		if doIndep {
 			g, w := run(1, kk)
 			indepG = g
 			fmt.Printf("%-12s %6d  %12.3f %12.3f  %14.3f %14s\n", "independent", kk, g, w, g*1000/float64(kk), "-")
-			emit(*csv, uint32(ver), bn, "independent", kk, *n, g, w, g*1000/float64(kk), 0)
+			emit(*csv, uint32(ver), bn, "independent", kk, *n, *distinct, g, w, g*1000/float64(kk), 0)
 		}
 		if doDep && doIndep && depG > 0 {
 			perBarr := (depG - indepG) * 1000 / float64(kk)
 			perDisp := indepG * 1000 / float64(kk)
 			fmt.Printf("%-12s %6d  %12s %12s  %14.3f %14.3f   <= isolated\n", "=>", kk, "", "", perDisp, perBarr)
-			emit(*csv, uint32(ver), bn, "isolated", kk, *n, depG-indepG, 0, perDisp, perBarr)
+			emit(*csv, uint32(ver), bn, "isolated", kk, *n, *distinct, depG-indepG, 0, perDisp, perBarr)
 		}
 	}
 }
 
-func emit(on bool, ver uint32, backend, mode string, k, n int, gpuMS, wallMS, perDisp, perBarr float64) {
+// CSV: csv,verHex,backend,mode,K,n,distinct,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us
+func emit(on bool, ver uint32, backend, mode string, k, n, distinct int, gpuMS, wallMS, perDisp, perBarr float64) {
 	if !on {
 		return
 	}
-	fmt.Printf("csv,0x%08x,%s,%s,%d,%d,%.4f,%.4f,%.4f,%.4f\n", ver, backend, mode, k, n, gpuMS, wallMS, perDisp, perBarr)
+	fmt.Printf("csv,0x%08x,%s,%s,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n", ver, backend, mode, k, n, distinct, gpuMS, wallMS, perDisp, perBarr)
 }
