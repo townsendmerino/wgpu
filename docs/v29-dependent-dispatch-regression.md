@@ -20,9 +20,22 @@ quant, swiglu, residual…), so each dispatch pays a pipeline+bind-group switch.
 second sweep ([pipeline-state-switch](#follow-up-2-done-pipeline-state-switching))
 cycled 1–8 distinct pipelines through the same dependent chain on the same GPU.
 Device-side per-dispatch time is **flat (~1.50 µs) at every N on every version,
-v22→v29** — the per-switch cost is ≈0 and does not regress. Pipeline switching
-does not explain goinfer's +1.9 ms. The remaining suspect is **naga codegen of
-the real kernels**; the recommended next probe is SPIR-V passthrough A/B (below).
+v22→v29** — the per-switch cost is ≈0 and does not regress.
+
+**Update 2 — naga codegen also ruled out; investigation closed.** The last cheap
+suspect was naga's SPIR-V codegen for the real glue kernels. An A/B
+([naga-codegen](#follow-up-3-done-naga-codegen-ab-spir-v-passthrough)) ran
+naga-22 vs naga-29 SPIR-V of real goinfer kernels (rmsnorm/qknorm/residual/swiglu)
+on the **same** v29 runtime via passthrough. naga 29 does emit +250 words of
+bounds-check code on the dynamic-loop kernels, but the **runtime delta is at the
+noise floor (≤+0.2 µs, ~5%, only on 2 kernels)** and the shipped v29 runtime path
+(naga 29.0.1) is actually the **fastest** arm. ≤4% of goinfer's gap. **All cheap,
+isolable axes — barriers, pipeline switches, codegen — are flat or negligible
+v22→v29.** The residual +1.9 ms is real but glue-specific and not cheaply
+isolable on the binding side (real memory traffic / resource tracking / dispatch
+counts the synthetic benches strip out). **Decision unchanged:** stay on
+cogentcore for decode; v29 only for its features; the lever is cutting glue
+dispatch count (decode fusion in goinfer, out of scope here).
 
 ---
 
@@ -268,6 +281,90 @@ Proposed isolation, decisive and small:
 
 This is the highest-value next step; it is intentionally **not** built here.
 
+## Follow-up 3 (done): naga codegen A/B (SPIR-V passthrough)
+
+Barriers and pipeline switches are flat; the last cheap suspect is **naga
+codegen of the real kernels**. To isolate the compiler from the runtime, real
+goinfer glue WGSL (copied verbatim as read-only fixtures under
+[`bench/nagaprobe/fixtures/`](../bench/nagaprobe/fixtures); goinfer untouched)
+was compiled to SPIR-V offline by **naga-cli 22.0.0** and **29.0.x**, and both
+blobs were run on the **same v29 runtime** via the standard `WGPUShaderSourceSPIRV`
+passthrough path (`cmd/nagaprobe`) — the runtime's own naga never runs, so the
+driver gets exactly the bytes each naga version emitted. Same dependent chain as
+chainprobe (K=400, one reused rw storage buffer ⇒ 1 barrier/dispatch), device
+timestamps, 60 runs. Arms: (a) naga 22 SPIR-V, (b) naga 29 SPIR-V, (c) the WGSL
+compiled by the v29 runtime's **own** naga 29.0.1 (the config goinfer actually uses).
+
+wgpu-native v22.1.0.5 (cogentcore's lib) pins naga 22.1.0; v29.0.0.0 pins naga 29.0.1.
+
+**SPIR-V size (naga 22 → naga 29):**
+
+| fixture  | shape                    | 22 → 29 bytes | Δwords |
+|----------|--------------------------|---------------|--------|
+| rmsnorm  | workgroup reduce + loops | 3500 → 4500   | **+250** |
+| qknorm   | workgroup reduce + loops | 3668 → 4668   | **+250** |
+| residual | trivial elementwise      | 1200 → 1200   | 0      |
+| swiglu   | elementwise + exp        | 1436 → 1436   | 0      |
+
+naga 29 emits **+250 words only on the two kernels with dynamically-bound,
+array-indexed loops** (rmsnorm/qknorm) and **nothing extra** on the loop-free
+elementwise kernels — i.e. it adds per-access bounds/robustness code in the loop
+bodies. So there *is* a real naga 22→29 codegen change, and it lands exactly
+where expected.
+
+**device-side per-dispatch GPU time (µs), K=400 (representative; reduce kernels are noisy at ~±0.15 µs):**
+
+| fixture  | (a) naga 22 spv | (b) naga 29 spv | (c) v29 runtime (naga 29.0.1) |
+|----------|-----------------|-----------------|-------------------------------|
+| rmsnorm  | 3.41            | 3.57            | **3.31**                      |
+| qknorm   | 3.43            | 3.28–3.66       | **2.81–3.38**                 |
+| residual | 1.371           | 1.369           | 1.369                         |
+| swiglu   | 1.400           | 1.396           | 1.507                         |
+
+**Verdict: branch 6 — naga codegen is NOT the cause.**
+- The naga-22-vs-29 *runtime* delta is **at the noise floor**: ~+0.15 µs (≈5%) on
+  rmsnorm, inconsistent in sign on qknorm across runs, and **zero** on the
+  elementwise controls. The +250-word bounds-check bloat barely moves the clock
+  on this GPU.
+- Crucially, arm (c) — the v29 runtime's own naga 29.0.1, which is **what goinfer
+  actually runs** — is the **fastest** arm, faster than naga-22 passthrough. The
+  runtime configures naga to emit lean code (device robustness handles bounds),
+  so the passthrough bloat doesn't even appear in the shipped path. There is no
+  regression in the configuration goinfer uses.
+
+**Magnitude vs goinfer.** Matching +1.9 ms over ~338 dispatches needs ≈ **5.6 µs
+per dispatch**. The worst-case naga effect measured is **≤ +0.2 µs** on *two* of
+the kernel shapes (and ≈0 in the shipped runtime path). Applying the worst case
+to *all* 338 dispatches (wildly generous — most glue is elementwise/flat) gives
+≈ +0.07 ms, **< 4 %** of the gap. naga codegen cannot explain the regression.
+
+### Decision: close the binding-side investigation
+
+All cheap, isolable suspects are now exhausted and flat:
+
+| axis                         | result (v22 → v29)                  |
+|------------------------------|-------------------------------------|
+| per-barrier cost (1–8/disp)  | flat (~1.33–2.5 µs, ±2%)            |
+| pipeline-state switch        | flat (~0 µs/switch)                 |
+| naga codegen (real kernels)  | ≤5% on 2 reduce kernels; 0 shipped  |
+
+The residual +1.9 ms is therefore **real but not cheaply isolable on the binding
+side** — it must involve effects the synthetic benches deliberately strip out:
+actual large-buffer **memory traffic** (these run on ~1 KB; real decode moves MB
+of weights/activations/KV per token), **resource-tracking/validation overhead
+with the real number of live resources**, or the real **dispatch/submit count and
+sizes**. None of these is a wgpu-version bug to file or a flag/pin to flip.
+
+**Decision unchanged:** stay on cogentcore for decode; use this v29 binding only
+for what needs v29 (dot4I8Packed / timestamp control / subgroup info), not for a
+glue speedup. The real lever remains **cutting the number of glue dispatches per
+token** — the decode-fusion work in goinfer — which attacks the cost directly and
+is independent of wgpu version. (goinfer is out of scope for this repo and was
+not modified.)
+
+Repro: `bash scripts/naga-spv.sh` (compile blobs) then the `nagaprobe` A/B loop
+in that script; blobs are committed under `bench/nagaprobe/spv/`.
+
 ## Appendix: raw CSV
 
 Original barrier sweep — `csv,verHex,backend,mode,K,n,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us`:
@@ -306,4 +403,21 @@ csv,0x1d000000,Vulkan,dependent,400,256,8,0.6018,1.0860,1.5044,0.0000
 csv,0x1b000401,Vulkan,dependent,400,256,8,0.6014,1.0629,1.5035,0.0000
 csv,0x19000202,Vulkan,dependent,400,256,8,0.6020,1.4894,1.5051,0.0000
 csv,0xcoge0023,vulkan,dependent,400,256,8,0.5980,1.6408,1.4950,0.0000
+```
+
+naga codegen A/B — `csv,verHex,fixture,label,K,gpu_ms,per_dispatch_us` (all on the v29 runtime; label = SPIR-V source):
+
+```
+csv,0x1d000000,rmsnorm,naga22,400,1.3625,3.4062
+csv,0x1d000000,rmsnorm,naga29,400,1.4237,3.5593
+csv,0x1d000000,rmsnorm,wgsl29rt,400,1.3228,3.3071
+csv,0x1d000000,qknorm,naga22,400,1.3842,3.4604
+csv,0x1d000000,qknorm,naga29,400,1.4657,3.6642
+csv,0x1d000000,qknorm,wgsl29rt,400,1.3524,3.3810
+csv,0x1d000000,residual,naga22,400,0.5484,1.3711
+csv,0x1d000000,residual,naga29,400,0.5475,1.3686
+csv,0x1d000000,residual,wgsl29rt,400,0.5476,1.3691
+csv,0x1d000000,swiglu,naga22,400,0.5599,1.3998
+csv,0x1d000000,swiglu,naga29,400,0.5586,1.3964
+csv,0x1d000000,swiglu,wgsl29rt,400,0.6028,1.5069
 ```
