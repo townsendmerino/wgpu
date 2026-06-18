@@ -11,23 +11,23 @@ import "C"
 type BufferUsage uint64
 
 const (
-	BufferUsageNone    BufferUsage = C.WGPUBufferUsage_None
-	BufferUsageMapRead BufferUsage = C.WGPUBufferUsage_MapRead
-	BufferUsageCopySrc BufferUsage = C.WGPUBufferUsage_CopySrc
-	BufferUsageCopyDst BufferUsage = C.WGPUBufferUsage_CopyDst
-	BufferUsageUniform BufferUsage = C.WGPUBufferUsage_Uniform
-	BufferUsageStorage BufferUsage = C.WGPUBufferUsage_Storage
+	BufferUsageNone         BufferUsage = 0x0000000000000000
+	BufferUsageMapRead      BufferUsage = 0x0000000000000001
+	BufferUsageCopySrc      BufferUsage = 0x0000000000000004
+	BufferUsageCopyDst      BufferUsage = 0x0000000000000008
+	BufferUsageUniform      BufferUsage = 0x0000000000000040
+	BufferUsageStorage      BufferUsage = 0x0000000000000080
 	// QueryResolve is needed for the destination of ResolveQuerySet (timestamps).
-	BufferUsageQueryResolve BufferUsage = C.WGPUBufferUsage_QueryResolve
+	BufferUsageQueryResolve BufferUsage = 0x0000000000000200
 )
 
 // MapMode is a bitset of WGPUMapMode flags.
 type MapMode uint64
 
 const (
-	MapModeNone  MapMode = C.WGPUMapMode_None
-	MapModeRead  MapMode = C.WGPUMapMode_Read
-	MapModeWrite MapMode = C.WGPUMapMode_Write
+	MapModeNone  MapMode = 0x0000000000000000
+	MapModeRead  MapMode = 0x0000000000000001
+	MapModeWrite MapMode = 0x0000000000000002
 )
 
 // PowerPreference mirrors WGPUPowerPreference.

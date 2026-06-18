@@ -101,8 +101,8 @@ type BindGroupLayoutEntry struct {
 type ShaderStage uint64
 
 const (
-	ShaderStageNone    ShaderStage = C.WGPUShaderStage_None
-	ShaderStageCompute ShaderStage = C.WGPUShaderStage_Compute
+	ShaderStageNone    ShaderStage = 0x0000000000000000
+	ShaderStageCompute ShaderStage = 0x0000000000000004
 )
 
 // BindGroupLayoutDescriptor mirrors cogentcore's subset.
