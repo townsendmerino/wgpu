@@ -80,21 +80,29 @@ static int np_init(uint32_t backend, char* nameOut, int nameCap, int* hasPassOut
     wgpuAdapterInfoFreeMembers(info);
 
     g_hasTS = wgpuAdapterHasFeature(g_adapter, WGPUFeatureName_TimestampQuery)?1:0;
-    int hasPass = wgpuAdapterHasFeature(g_adapter, (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough)?1:0;
-    *hasTSout = g_hasTS; *hasPassOut = hasPass;
 
-    WGPUFeatureName feats[2]; int nf=0;
-    if(g_hasTS) feats[nf++] = WGPUFeatureName_TimestampQuery;
-    if(hasPass) feats[nf++] = (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough;
-    WGPUDeviceDescriptor dd; memset(&dd,0,sizeof(dd));
-    dd.requiredFeatures = feats; dd.requiredFeatureCount = (size_t)nf;
-    dvRes dr; dr.status=0; dr.device=NULL; dr.done=0;
-    WGPURequestDeviceCallbackInfo dci; memset(&dci,0,sizeof(dci));
-    dci.mode = WGPUCallbackMode_AllowProcessEvents; dci.callback = dvCB; dci.userdata1=&dr;
-    wgpuAdapterRequestDevice(g_adapter, &dd, dci);
-    for(int g=0; !dr.done && g<1000000; ++g) wgpuInstanceProcessEvents(g_inst);
-    if(!dr.device) return 3;
-    g_device = dr.device;
+    // SpirvShaderPassthrough is a wgpu-native native feature that HasFeature does
+    // not reliably enumerate; the real test is whether the device accepts it.
+    // Request it (plus timestamps); if device creation fails, retry without and
+    // report passthrough as unavailable.
+    WGPUDevice dev = NULL; int hasPass = 0;
+    for(int attempt=0; attempt<2 && !dev; attempt++){
+        WGPUFeatureName feats[2]; int nf=0;
+        if(g_hasTS) feats[nf++] = WGPUFeatureName_TimestampQuery;
+        if(attempt==0) feats[nf++] = (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough;
+        WGPUDeviceDescriptor dd; memset(&dd,0,sizeof(dd));
+        dd.requiredFeatures = feats; dd.requiredFeatureCount = (size_t)nf;
+        dvRes dr; dr.status=0; dr.device=NULL; dr.done=0;
+        WGPURequestDeviceCallbackInfo dci; memset(&dci,0,sizeof(dci));
+        dci.mode = WGPUCallbackMode_AllowProcessEvents; dci.callback = dvCB; dci.userdata1=&dr;
+        wgpuAdapterRequestDevice(g_adapter, &dd, dci);
+        for(int g=0; !dr.done && g<1000000; ++g) wgpuInstanceProcessEvents(g_inst);
+        dev = dr.device;
+        if(dev && attempt==0) hasPass = 1;
+    }
+    *hasTSout = g_hasTS; *hasPassOut = hasPass;
+    if(!dev) return 3;
+    g_device = dev;
     g_queue  = wgpuDeviceGetQueue(g_device);
     g_period = g_hasTS ? wgpuQueueGetTimestampPeriod(g_queue) : 1.0f;
     return 0;
