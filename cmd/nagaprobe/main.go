@@ -62,7 +62,14 @@ static int                 g_npipes;
 
 static int np_init(uint32_t backend, char* nameOut, int nameCap, int* hasPassOut, int* hasTSout, uint32_t* verOut){
     *verOut = wgpuGetVersion();
-    g_inst = wgpuCreateInstance(NULL);
+    // Enable the standard SPIR-V passthrough path (WGPUShaderSourceSPIRV chained
+    // struct) via the instance feature. The native wgpuDeviceCreateShaderModuleSpirV
+    // path (PASSTHROUGH_SHADERS device feature) is NOT advertised by this
+    // NVIDIA/v29 build, but the standardized instance feature is.
+    WGPUInstanceFeatureName ifeats[1] = { WGPUInstanceFeatureName_ShaderSourceSPIRV };
+    WGPUInstanceDescriptor idesc; memset(&idesc,0,sizeof(idesc));
+    idesc.requiredFeatureCount = 1; idesc.requiredFeatures = ifeats;
+    g_inst = wgpuCreateInstance(&idesc);
     if(!g_inst) return 1;
     WGPURequestAdapterOptions opt; memset(&opt,0,sizeof(opt));
     opt.powerPreference = WGPUPowerPreference_HighPerformance;
@@ -80,38 +87,20 @@ static int np_init(uint32_t backend, char* nameOut, int nameCap, int* hasPassOut
     if(info.device.data && nameOut){ size_t n=info.device.length<(size_t)(nameCap-1)?info.device.length:(size_t)(nameCap-1); memcpy(nameOut,info.device.data,n); nameOut[n]=0; }
     wgpuAdapterInfoFreeMembers(info);
 
-    { // diagnostic: list adapter features (find passthrough's advertised value)
-        WGPUSupportedFeatures sf; memset(&sf,0,sizeof(sf));
-        wgpuAdapterGetFeatures(g_adapter, &sf);
-        fprintf(stderr, "adapter features (%zu):", sf.featureCount);
-        for(size_t i=0;i<sf.featureCount;i++) fprintf(stderr, " 0x%08x", (unsigned)sf.features[i]);
-        fprintf(stderr, "\n");
-        wgpuSupportedFeaturesFreeMembers(sf);
-    }
     g_hasTS = wgpuAdapterHasFeature(g_adapter, WGPUFeatureName_TimestampQuery)?1:0;
+    *hasTSout = g_hasTS; *hasPassOut = 1; // standard SPIRV passthrough via instance feature
 
-    // SpirvShaderPassthrough is a wgpu-native native feature that HasFeature does
-    // not reliably enumerate; the real test is whether the device accepts it.
-    // Request it (plus timestamps); if device creation fails, retry without and
-    // report passthrough as unavailable.
-    WGPUDevice dev = NULL; int hasPass = 0;
-    for(int attempt=0; attempt<2 && !dev; attempt++){
-        WGPUFeatureName feats[2]; int nf=0;
-        if(g_hasTS) feats[nf++] = WGPUFeatureName_TimestampQuery;
-        if(attempt==0) feats[nf++] = (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough;
-        WGPUDeviceDescriptor dd; memset(&dd,0,sizeof(dd));
-        dd.requiredFeatures = feats; dd.requiredFeatureCount = (size_t)nf;
-        dvRes dr; dr.status=0; dr.device=NULL; dr.done=0;
-        WGPURequestDeviceCallbackInfo dci; memset(&dci,0,sizeof(dci));
-        dci.mode = WGPUCallbackMode_AllowProcessEvents; dci.callback = dvCB; dci.userdata1=&dr;
-        wgpuAdapterRequestDevice(g_adapter, &dd, dci);
-        for(int g=0; !dr.done && g<1000000; ++g) wgpuInstanceProcessEvents(g_inst);
-        dev = dr.device;
-        if(dev && attempt==0) hasPass = 1;
-    }
-    *hasTSout = g_hasTS; *hasPassOut = hasPass;
-    if(!dev) return 3;
-    g_device = dev;
+    WGPUFeatureName feats[1]; int nf=0;
+    if(g_hasTS) feats[nf++] = WGPUFeatureName_TimestampQuery;
+    WGPUDeviceDescriptor dd; memset(&dd,0,sizeof(dd));
+    dd.requiredFeatures = feats; dd.requiredFeatureCount = (size_t)nf;
+    dvRes dr; dr.status=0; dr.device=NULL; dr.done=0;
+    WGPURequestDeviceCallbackInfo dci; memset(&dci,0,sizeof(dci));
+    dci.mode = WGPUCallbackMode_AllowProcessEvents; dci.callback = dvCB; dci.userdata1=&dr;
+    wgpuAdapterRequestDevice(g_adapter, &dd, dci);
+    for(int g=0; !dr.done && g<1000000; ++g) wgpuInstanceProcessEvents(g_inst);
+    if(!dr.device) return 3;
+    g_device = dr.device;
     g_queue  = wgpuDeviceGetQueue(g_device);
     g_period = g_hasTS ? wgpuQueueGetTimestampPeriod(g_queue) : 1.0f;
     return 0;
@@ -140,9 +129,13 @@ static int np_pipeline(int fromSpirv, const uint32_t* spv, int nWords, const cha
 
     WGPUShaderModule sh;
     if(fromSpirv){
-        WGPUShaderModuleDescriptorSpirV sd; memset(&sd,0,sizeof(sd));
-        sd.sourceSize=(uint32_t)nWords; sd.source=spv;
-        sh = wgpuDeviceCreateShaderModuleSpirV(g_device,&sd);
+        // Standard passthrough: chain WGPUShaderSourceSPIRV on the normal descriptor
+        // (driver gets exactly these bytes; the runtime's naga never runs).
+        WGPUShaderSourceSPIRV ss; memset(&ss,0,sizeof(ss));
+        ss.chain.sType = WGPUSType_ShaderSourceSPIRV;
+        ss.codeSize = (uint32_t)nWords; ss.code = spv;
+        WGPUShaderModuleDescriptor smd; memset(&smd,0,sizeof(smd)); smd.nextInChain = &ss.chain;
+        sh = wgpuDeviceCreateShaderModule(g_device,&smd);
     } else {
         WGPUShaderSourceWGSL w; memset(&w,0,sizeof(w)); w.chain.sType=WGPUSType_ShaderSourceWGSL; w.code=sv(wgsl);
         WGPUShaderModuleDescriptor smd; memset(&smd,0,sizeof(smd)); smd.nextInChain=&w.chain;
