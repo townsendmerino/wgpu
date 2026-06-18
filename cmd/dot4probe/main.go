@@ -159,7 +159,7 @@ func run() error {
 // cpuDot4 is the reference: signed 8-bit lanes packed little-endian in a u32.
 func cpuDot4(x, y uint32) int32 {
 	var s int32
-	for j := 0; j < 4; j++ {
+	for j := range 4 {
 		xs := int32(int8(x >> (8 * j)))
 		ys := int32(int8(y >> (8 * j)))
 		s += xs * ys
@@ -269,7 +269,7 @@ func validate(device *wgpu.Device, queue *wgpu.Queue) error {
 	}
 	got := wgpu.FromBytes[int32](stage.GetMappedRange(0, uint(n*4)))
 	mism := 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if got[i] != cpuDot4(a[i], b[i]) {
 			if mism < 5 {
 				fmt.Printf("  mismatch at %d: gpu=%d cpu=%d (a=%08x b=%08x)\n", i, got[i], cpuDot4(a[i], b[i]), a[i], b[i])
@@ -421,7 +421,7 @@ func benchKernel(device *wgpu.Device, queue *wgpu.Queue, code, label string, n, 
 
 	var gpuNS float64
 	wallStart := time.Now()
-	for r := 0; r < runs; r++ {
+	for range runs {
 		var tw *wgpu.ComputePassTimestampWrites
 		if hasTimestamp {
 			tw = &wgpu.ComputePassTimestampWrites{QuerySet: qset, BeginningOfPassWriteIndex: 0, EndOfPassWriteIndex: 1}

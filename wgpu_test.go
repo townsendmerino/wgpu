@@ -45,7 +45,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 func cpuDot4(x, y uint32) int32 {
 	var s int32
-	for j := 0; j < 4; j++ {
+	for j := range 4 {
 		s += int32(int8(x>>(8*j))) * int32(int8(y>>(8*j)))
 	}
 	return s
@@ -132,7 +132,7 @@ func TestDot4Correctness(t *testing.T) {
 		t.Fatalf("map failed: %v", status)
 	}
 	got := wgpu.FromBytes[int32](stage.GetMappedRange(0, n*4))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if want := cpuDot4(a[i], b[i]); got[i] != want {
 			t.Fatalf("dot4 mismatch at %d: got %d want %d (ABI/offset bug?)", i, got[i], want)
 		}
