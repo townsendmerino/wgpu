@@ -14,6 +14,16 @@ wgpu-hal barrier change** — it is **specific to goinfer's setup** (and likely 
 barrier-bound at all). There is **no version "sweet-spot" pin to recover** and
 **no upstream bug to file**.
 
+**Update — pipeline-state switching also ruled out.** The barrier sweep used one
+re-dispatched pipeline; real glue cycles many distinct pipelines (rope, rmsnorm,
+quant, swiglu, residual…), so each dispatch pays a pipeline+bind-group switch. A
+second sweep ([pipeline-state-switch](#follow-up-2-done-pipeline-state-switching))
+cycled 1–8 distinct pipelines through the same dependent chain on the same GPU.
+Device-side per-dispatch time is **flat (~1.50 µs) at every N on every version,
+v22→v29** — the per-switch cost is ≈0 and does not regress. Pipeline switching
+does not explain goinfer's +1.9 ms. The remaining suspect is **naga codegen of
+the real kernels**; the recommended next probe is SPIR-V passthrough A/B (below).
+
 ---
 
 ## What was measured
@@ -175,9 +185,92 @@ equally. (Out of scope for this repo; goinfer is not modified here.)
 Reproduce: `BINDINGS=8 GO=$HOME/sdk/go/bin/go BACKEND=vulkan KS=400 bash scripts/bisect.sh`
 and `cd bench/cogentbase && ./cogentbase -ksweep 400 -bindings 8 -csv`.
 
+## Follow-up 2 (done): pipeline-state switching
+
+The barrier sweep above re-dispatches **one** pipeline. goinfer's real decode
+glue — ~338 tiny serially-dependent dispatches/token — instead cycles **many
+distinct pipelines** (rope, rmsnorm, quant, swiglu, residual, …), so each
+dispatch incurs a `SetPipeline(different)` + `SetBindGroup(different)`. That
+pipeline+bind-group **state switch** is the one axis the flat synthetic chain
+never exercised. This sweep isolates it.
+
+`-distinct N` cycles **N genuinely distinct compute pipelines** (each a separate
+shader module + pipeline object — verified by checking the handles differ; a
+distinct baked constant prevents wgpu from deduping them), each with its own bind
+group, across the K dependent dispatches. Everything else is held identical to
+the `N=1` control: same tiny per-dispatch work, same serial dependency (1
+read-write storage barrier/dispatch), same K=400. The only new variable is the
+per-dispatch pipeline+bindgroup switch. Measured with **device-side timestamp
+queries** (not Submit+Poll wall clock).
+
+**switch cost = per-dispatch GPU time at N − at N=1** (cancels the
+barrier/dispatch baseline, leaving the pipeline+bindgroup-switch cost).
+
+**device-side per-dispatch GPU time (µs) — N pipelines × version (K=400, 50 runs):**
+
+| N (distinct pipelines) | cogent (v22-era) | v25.0.2.2 | v27.0.4.1 | v29.0.0.0 |
+|------------------------|------------------|-----------|-----------|-----------|
+| 1 (baseline)           | 1.495            | 1.503     | 1.502     | 1.507     |
+| 2                      | 1.495            | 1.504     | 1.504     | 1.502     |
+| 4                      | 1.495            | 1.504     | 1.504     | 1.503     |
+| 8                      | 1.495            | 1.505     | 1.504     | 1.504     |
+
+**switch cost (µs):**
+
+| N | cogent (v22) | v25    | v27    | v29    |
+|---|--------------|--------|--------|--------|
+| 2 | 0.000        | +0.000 | +0.002 | −0.005 |
+| 4 | 0.000        | +0.000 | +0.002 | −0.004 |
+| 8 | 0.000        | +0.001 | +0.002 | −0.003 |
+
+**Verdict: branch 6 — pipeline-state switching is NOT the cause.** On the GPU
+timeline, cycling 8 distinct pipelines costs the same per dispatch as
+re-dispatching one (~1.50 µs), and this is true on every generation from the
+v22-era baseline through v29. The per-switch cost is ≈0 and the **v22→v29 gap
+never opens** (it is within ±0.005 µs — noise — at every N). On NVIDIA Vulkan a
+pipeline+descriptor-set bind is essentially free on the device timeline and was
+not made more expensive in any wgpu-native generation.
+
+**Magnitude check vs goinfer.** Matching goinfer's +1.9 ms over ~338
+switches/token would require a v29-vs-v22 switch-cost delta of ≈ 1.9 ms / 338 ≈
+**5.6 µs/switch**. Measured delta: **≈0 µs/switch** (v29 is if anything a hair
+faster than v22). Pipeline switching accounts for ~**0%** of the regression —
+three-plus orders of magnitude short.
+
+(Aside, CPU side: wall-clock per-iteration rose ~0.1 ms going N=1→N≥2 on v29 —
+real but tiny CPU encode cost of distinct `SetPipeline`/`SetBindGroup` calls, of
+the same order on all versions, and not the device-side GPU regression goinfer
+measured with timestamps. This is exactly why the experiment uses device
+timestamps, not Submit+Poll wall clock — the earlier tooling mistake.)
+
+### Recommended next probe (not built here): SPIR-V passthrough A/B
+
+Barriers (1–8/dispatch) and pipeline switching (1–8 distinct) are both flat
+v22→v29. The one thing all these synthetic benches share is a **trivial kernel**
+(`out[i]=in[i]+1`). The remaining suspect is **naga codegen of the *real* glue
+kernels** — if v29's naga emits worse SPIR-V (more instructions, worse register
+allocation, lost vectorization, extra bounds checks) for goinfer's actual
+rope/rmsnorm/quant/swiglu shaders, only those kernels would show it.
+
+Proposed isolation, decisive and small:
+1. Take one real glue kernel's WGSL from goinfer (read-only; do not modify
+   goinfer).
+2. Compile it to SPIR-V **once** with each version's naga (`naga in.wgsl out.spv`,
+   matching the pinned wgpu-native commits), and `diff` the disassembly.
+3. A/B the two SPIR-V blobs on the same v29 runtime via
+   `ShaderSourceSPIRV`/SpirvShaderPassthrough (bypasses naga at run time), in the
+   same dependent chain, device timestamps.
+   - If the v22-naga SPIR-V runs faster than the v29-naga SPIR-V → **naga codegen
+     regression**, now with a minimal filable upstream repro (the two .spv + the
+     timing).
+   - If both run identically → the cost is not in the kernel binary either, and
+     attention turns to dispatch/submit *count* or buffer sizes in the real glue.
+
+This is the highest-value next step; it is intentionally **not** built here.
+
 ## Appendix: raw CSV
 
-`csv,verHex,backend,mode,K,n,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us`
+Original barrier sweep — `csv,verHex,backend,mode,K,n,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us`:
 
 ```
 csv,0xcoge0023,vulkan,isolated,100,256,0.1328,0.0000,0.2083,1.3277
@@ -192,4 +285,25 @@ csv,0x1b000401,Vulkan,isolated,400,256,0.5496,0.0000,0.1550,1.3739
 csv,0x1d000000,Vulkan,isolated,100,256,0.1300,0.0000,0.1545,1.3000
 csv,0x1d000000,Vulkan,isolated,200,256,0.2600,0.0000,0.1545,1.3000
 csv,0x1d000000,Vulkan,isolated,400,256,0.5413,0.0000,0.1545,1.3533
+```
+
+Pipeline-state-switch sweep — `csv,verHex,backend,mode,K,n,distinct,gpu_ms,wall_ms,per_dispatch_us,per_barrier_us` (dependent rows; per_dispatch_us is the device-side switch metric):
+
+```
+csv,0x1d000000,Vulkan,dependent,400,256,1,0.6028,0.9554,1.5070,0.0000
+csv,0x1b000401,Vulkan,dependent,400,256,1,0.6009,0.9449,1.5022,0.0000
+csv,0x19000202,Vulkan,dependent,400,256,1,0.6014,0.9451,1.5034,0.0000
+csv,0xcoge0023,vulkan,dependent,400,256,1,0.5980,1.5133,1.4950,0.0000
+csv,0x1d000000,Vulkan,dependent,400,256,2,0.6007,1.0775,1.5018,0.0000
+csv,0x1b000401,Vulkan,dependent,400,256,2,0.6016,1.0611,1.5041,0.0000
+csv,0x19000202,Vulkan,dependent,400,256,2,0.6014,1.0833,1.5035,0.0000
+csv,0xcoge0023,vulkan,dependent,400,256,2,0.5980,1.4863,1.4950,0.0000
+csv,0x1d000000,Vulkan,dependent,400,256,4,0.6014,1.0761,1.5034,0.0000
+csv,0x1b000401,Vulkan,dependent,400,256,4,0.6015,1.0597,1.5038,0.0000
+csv,0x19000202,Vulkan,dependent,400,256,4,0.6015,1.0853,1.5038,0.0000
+csv,0xcoge0023,vulkan,dependent,400,256,4,0.5980,1.1229,1.4950,0.0000
+csv,0x1d000000,Vulkan,dependent,400,256,8,0.6018,1.0860,1.5044,0.0000
+csv,0x1b000401,Vulkan,dependent,400,256,8,0.6014,1.0629,1.5035,0.0000
+csv,0x19000202,Vulkan,dependent,400,256,8,0.6020,1.4894,1.5051,0.0000
+csv,0xcoge0023,vulkan,dependent,400,256,8,0.5980,1.6408,1.4950,0.0000
 ```
