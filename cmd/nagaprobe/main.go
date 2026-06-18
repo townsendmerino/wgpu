@@ -34,6 +34,7 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 #include "../../lib/webgpu.h"
 #include "../../lib/wgpu.h"
@@ -79,6 +80,14 @@ static int np_init(uint32_t backend, char* nameOut, int nameCap, int* hasPassOut
     if(info.device.data && nameOut){ size_t n=info.device.length<(size_t)(nameCap-1)?info.device.length:(size_t)(nameCap-1); memcpy(nameOut,info.device.data,n); nameOut[n]=0; }
     wgpuAdapterInfoFreeMembers(info);
 
+    { // diagnostic: list adapter features (find passthrough's advertised value)
+        WGPUSupportedFeatures sf; memset(&sf,0,sizeof(sf));
+        wgpuAdapterGetFeatures(g_adapter, &sf);
+        fprintf(stderr, "adapter features (%zu):", sf.featureCount);
+        for(size_t i=0;i<sf.featureCount;i++) fprintf(stderr, " 0x%08x", (unsigned)sf.features[i]);
+        fprintf(stderr, "\n");
+        wgpuSupportedFeaturesFreeMembers(sf);
+    }
     g_hasTS = wgpuAdapterHasFeature(g_adapter, WGPUFeatureName_TimestampQuery)?1:0;
 
     // SpirvShaderPassthrough is a wgpu-native native feature that HasFeature does
