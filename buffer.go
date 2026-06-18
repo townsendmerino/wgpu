@@ -58,6 +58,15 @@ func (d *Device) CreateBuffer(descriptor *BufferDescriptor) (*Buffer, error) {
 	if ref == nil {
 		return nil, errors.New("wgpu: CreateBuffer failed: " + errOr(takeLastError(), "validation error"))
 	}
+	// v29 returns a NON-null handle even when allocation validation-fails (e.g. OOM,
+	// "Not enough memory left") — the failure is reported synchronously via the
+	// uncaptured-error callback during the call. Surface it as a Go error (and release
+	// the dead handle) so callers can recover, rather than using an unusable buffer and
+	// aborting later in GetMappedRange.
+	if msg := takeLastError(); msg != "" {
+		C.wgpuBufferRelease(ref)
+		return nil, errors.New("wgpu: CreateBuffer failed: " + msg)
+	}
 	return &Buffer{ref: ref}, nil
 }
 
