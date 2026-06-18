@@ -1,0 +1,24 @@
+github.com/townsendmerino/wgpu
+===============================
+
+This package vendors prebuilt static libraries and C headers from wgpu-native,
+pinned to release v29.0.0.0 (https://github.com/gfx-rs/wgpu-native).
+
+Vendored blobs:
+  lib/<goos>/<goarch>/libwgpu_native.a   prebuilt static library
+  lib/webgpu.h                           header from the v29.0.0.0 release archive
+  lib/wgpu.h                             header from the v29.0.0.0 release archive
+
+These are taken verbatim from the v29.0.0.0 release archives so that the headers
+match the linked library ABI exactly.
+
+wgpu-native is Copyright (c) 2021 The gfx-rs developers and is licensed under
+either of:
+
+  * Apache License, Version 2.0  (see lib/licenses/LICENSE.APACHE)
+  * MIT license                  (see lib/licenses/LICENSE.MIT)
+
+at your option. The vendored libwgpu_native.a binaries are redistributed under
+those same terms.
+
+The Go binding code in this repository is original work; see LICENSE.

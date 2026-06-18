@@ -1,0 +1,9 @@
+# transient fetch artifacts
+.fetch-tmp/
+
+# binaries
+/dot4probe
+*.test
+
+# OS junk
+.DS_Store
